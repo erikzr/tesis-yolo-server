@@ -34,9 +34,32 @@ def _ke_b64(rgb: np.ndarray) -> str:
 
 
 def _dari_b64(teks: str) -> np.ndarray:
+    import os, tempfile
     if "," in teks and teks.lstrip().startswith("data:"):
         teks = teks.split(",", 1)[1]
-    return np.asarray(Image.open(io.BytesIO(base64.b64decode(teks))).convert("RGB"))
+    raw = base64.b64decode(teks)
+    try:
+        return np.asarray(Image.open(io.BytesIO(raw)).convert("RGB"))
+    except Exception:
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        
+        # Fallback ekstraksi frame jika bytes adalah rekaman video
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
+            f.write(raw)
+            tpath = f.name
+        cap = cv2.VideoCapture(tpath)
+        ret, frame = cap.read()
+        cap.release()
+        try:
+            os.remove(tpath)
+        except Exception:
+            pass
+        if ret and frame is not None:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        raise ValueError("Format file tidak dapat diidentifikasi sebagai citra atau rekaman visual valid.")
 
 
 class MesinAnalisis:
