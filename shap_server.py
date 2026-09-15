@@ -406,6 +406,7 @@ def create_app(model_path: str = "/content/best.pt") -> Flask:
             response = {
                 "status": "sukses",
                 "is_video": is_video,
+                "gambar_asli": _ke_b64(rgb),
                 "gambar_deteksi": _ke_b64(anotasi),
                 "deteksi": objek,
                 "kelas_top": kelas_top,
