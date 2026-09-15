@@ -1,0 +1,10 @@
+ultralytics
+flask
+flask-cors
+pyngrok
+lime
+shap
+scikit-image
+transformers
+sentencepiece
+sacremoses

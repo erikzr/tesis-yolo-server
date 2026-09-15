@@ -345,7 +345,7 @@ class MesinAnalisis:
 
 def create_app(model_path: str = "/content/best.pt") -> Flask:
     app = Flask(__name__)
-    app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+    app.config["MAX_CONTENT_LENGTH"] = 64 * 1024 * 1024
     CORS(app)
     mesin = MesinAnalisis(model_path)
 
