@@ -177,7 +177,15 @@ class MesinAnalisis:
 
     def deteksi(self, rgb: np.ndarray, confidence: float):
         mulai = time.perf_counter()
-        hasil = self.yolo.predict(rgb, conf=confidence, verbose=False, device=self.device)[0]
+        # imgsz=640 dan iou=0.45 untuk meningkatkan ketepatan lokalisasi objek kendaraan
+        hasil = self.yolo.predict(
+            rgb, 
+            conf=confidence, 
+            iou=0.45,
+            imgsz=640,
+            verbose=False, 
+            device=self.device
+        )[0]
         waktu = time.perf_counter() - mulai
         anotasi = cv2.cvtColor(hasil.plot(), cv2.COLOR_BGR2RGB)
         objek = []
@@ -189,11 +197,46 @@ class MesinAnalisis:
                 "confidence": float(box.conf.item()),
                 "bbox": [float(x) for x in box.xyxy[0].tolist()],
             })
+
+        # Disambiguasi Spasial: Validasi Interaksi Overlap untuk Single vs Multiple Accident
         kelas_top = max(objek, key=lambda x: x["confidence"])["kelas"] if objek else "Tidak ada"
+        accident_objs = [o for o in objek if any(k in o["kelas"].lower() for k in ["accident", "crash", "collision", "single", "multiple"]) and "normal" not in o["kelas"].lower()]
+        
+        if accident_objs:
+            if len(accident_objs) >= 2:
+                kelas_top = "multiple_accident"
+            elif len(accident_objs) == 1:
+                # Cek interaksi overlap spasial dengan kendaraan di sekitarnya
+                single_box = accident_objs[0]["bbox"]
+                has_partner = False
+                for other in objek:
+                    if other is not accident_objs[0]:
+                        other_box = other["bbox"]
+                        # Hitung IoU
+                        xA = max(single_box[0], other_box[0])
+                        yA = max(single_box[1], other_box[1])
+                        xB = min(single_box[2], other_box[2])
+                        yB = min(single_box[3], other_box[3])
+                        interArea = max(0, xB - xA) * max(0, yB - yA)
+                        boxAArea = max(1e-5, (single_box[2] - single_box[0]) * (single_box[3] - single_box[1]))
+                        boxBArea = max(1e-5, (other_box[2] - other_box[0]) * (other_box[3] - other_box[1]))
+                        iou_val = interArea / float(boxAArea + boxBArea - interArea)
+                        
+                        c1 = ((single_box[0]+single_box[2])/2, (single_box[1]+single_box[3])/2)
+                        c2 = ((other_box[0]+other_box[2])/2, (other_box[1]+other_box[3])/2)
+                        dist = np.hypot(c1[0]-c2[0], c1[1]-c2[1])
+                        if iou_val > 0.12 or dist < 90:
+                            has_partner = True
+                            break
+                if has_partner or "multiple" in accident_objs[0]["kelas"].lower():
+                    kelas_top = "multiple_accident"
+                else:
+                    kelas_top = "single accident"
+
         return hasil, anotasi, objek, kelas_top, waktu
 
     def deteksi_video(self, video_bytes: bytes, confidence: float):
-        """Ekstraksi spatio-temporal tracking & deteksi sekuens frame dari rekaman video CCTV."""
+        """Ekstraksi dense spatio-temporal tracking & deteksi sekuens frame dari rekaman video CCTV."""
         import tempfile
         mulai = time.perf_counter()
         with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as f:
@@ -204,10 +247,11 @@ class MesinAnalisis:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 25.0)
         
-        num_samples = min(24, max(6, total_frames))
-        frame_indices = np.linspace(0, total_frames - 1, num_samples, dtype=int)
+        # Pass 1: Dense Sampling (64-80 frame untuk memastikan momen tabrakan cepat tidak terlewat)
+        num_samples = min(64, max(16, total_frames))
+        frame_indices = sorted(list(set(np.linspace(0, total_frames - 1, num_samples, dtype=int).tolist())))
         
-        sampled_results = []
+        sampled_dict = {}
         for idx in frame_indices:
             cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
             ret, frame = cap.read()
@@ -216,7 +260,7 @@ class MesinAnalisis:
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             _, anotasi, objek, kelas_top, _ = self.deteksi(frame_rgb, confidence)
             top_c = max([o["confidence"] for o in objek], default=0.0) if objek else 0.0
-            sampled_results.append({
+            sampled_dict[int(idx)] = {
                 "frame_idx": int(idx),
                 "timestamp_sec": round(float(idx) / fps, 2),
                 "objek": objek,
@@ -224,7 +268,39 @@ class MesinAnalisis:
                 "max_conf": top_c,
                 "frame_rgb": frame_rgb,
                 "anotasi": anotasi,
-            })
+            }
+
+        # Pass 2: Fine-grained search di sekitar puncak anomali
+        accident_candidates = [
+            item for item in sampled_dict.values() 
+            if any(k in item["kelas_top"].lower() for k in ["accident", "crash", "collision", "kecelakaan", "single", "multiple"])
+            and "normal" not in item["kelas_top"].lower()
+        ]
+        
+        if accident_candidates:
+            best_cand = max(accident_candidates, key=lambda x: x["max_conf"])
+            peak_target = best_cand["frame_idx"]
+            fine_start = max(0, peak_target - 12)
+            fine_end = min(total_frames - 1, peak_target + 12)
+            fine_step = max(1, (fine_end - fine_start) // 10)
+            for f_idx in range(fine_start, fine_end + 1, fine_step):
+                if f_idx not in sampled_dict:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, int(f_idx))
+                    ret, frame = cap.read()
+                    if ret and frame is not None:
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        _, anotasi, objek, kelas_top, _ = self.deteksi(frame_rgb, confidence)
+                        top_c = max([o["confidence"] for o in objek], default=0.0) if objek else 0.0
+                        sampled_dict[int(f_idx)] = {
+                            "frame_idx": int(f_idx),
+                            "timestamp_sec": round(float(f_idx) / fps, 2),
+                            "objek": objek,
+                            "kelas_top": kelas_top,
+                            "max_conf": top_c,
+                            "frame_rgb": frame_rgb,
+                            "anotasi": anotasi,
+                        }
+        
         cap.release()
         try:
             os.remove(temp_video_path)
@@ -232,10 +308,12 @@ class MesinAnalisis:
             pass
 
         waktu_total = time.perf_counter() - mulai
+        sampled_results = [sampled_dict[k] for k in sorted(sampled_dict.keys())]
         
         if sampled_results:
+            # Prioritas: Jika terdeteksi kecelakaan pada sekuens, angkat sebagai Peak Incident Item
             peak_item = max(sampled_results, key=lambda x: (
-                2 if any(k in x["kelas_top"].lower() for k in ["accident", "crash", "collision", "kecelakaan"]) else 0,
+                10 if (any(k in x["kelas_top"].lower() for k in ["accident", "crash", "collision", "kecelakaan", "single", "multiple"]) and "normal" not in x["kelas_top"].lower()) else 0,
                 x["max_conf"]
             ))
             pre_item = sampled_results[0]
